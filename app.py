@@ -9,6 +9,7 @@ import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
 HF_MODEL_REPO = os.getenv("HF_MODEL_REPO", "Tomath02/proto4")
+HF_MODEL_SUBFOLDER = os.getenv("HF_MODEL_SUBFOLDER", "best_model").strip()
 LOCAL_MODEL_DIR = os.getenv("LOCAL_INDOBERT_MODEL_DIR", "").strip()
 SVM_MODEL_PATH = Path(os.getenv("SVM_MODEL_PATH", APP_DIR / "models" / "svm" / "tfidf_svm_pipeline.joblib"))
 INDOBERT_THRESHOLD = float(os.getenv("INDOBERT_THRESHOLD", "0.5"))
@@ -166,15 +167,20 @@ def resolve_model_source() -> str:
 
 
 @st.cache_resource(show_spinner="Memuat model IndoBERT...")
-def load_indobert_model(model_source: str):
+def load_indobert_model(model_source: str, hf_subfolder: str):
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     source_path = Path(model_source)
     use_local = source_path.exists()
+    subfolder = None if use_local or not hf_subfolder.strip() else hf_subfolder.strip()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=use_local)
-    model = AutoModelForSequenceClassification.from_pretrained(model_source, local_files_only=use_local)
+    tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=use_local, subfolder=subfolder)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_source,
+        local_files_only=use_local,
+        subfolder=subfolder,
+    )
     ai_label_id = infer_ai_label_id(model.config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -340,10 +346,11 @@ with st.sidebar:
 
     if model_choice == "IndoBERT":
         model_source = st.text_input("Model IndoBERT", value=resolve_model_source())
+        hf_subfolder = st.text_input("Subfolder Hugging Face", value=HF_MODEL_SUBFOLDER)
         threshold = st.slider("Batas keputusan AI", 0.01, 0.99, INDOBERT_THRESHOLD, 0.01)
         max_length = st.select_slider("Max token length", options=[96, 128, 256, 384, 512], value=256)
         overlap_tokens = st.slider("Token overlap", 0, 96, 32, 8)
-        st.caption("Default deploy memakai Hugging Face repo. Untuk lokal, bisa pakai LOCAL_INDOBERT_MODEL_DIR.")
+        st.caption("Default deploy memakai Hugging Face repo dan subfolder best_model. Untuk lokal, bisa pakai LOCAL_INDOBERT_MODEL_DIR.")
     else:
         svm_model_path = st.text_input("Path model SVM", value=str(SVM_MODEL_PATH))
         svm_threshold = st.slider("Batas skor SVM", -2.0, 2.0, SVM_THRESHOLD, 0.05)
@@ -387,7 +394,7 @@ with right:
                 blocks = [compact_text(text)]
 
             if model_choice == "IndoBERT":
-                tokenizer, model, device, ai_label_id, id2label = load_indobert_model(model_source)
+                tokenizer, model, device, ai_label_id, id2label = load_indobert_model(model_source, hf_subfolder)
                 chunk_rows = build_token_chunks(
                     blocks,
                     tokenizer,
@@ -494,8 +501,8 @@ with right:
             st.error(f"Gagal menjalankan deteksi: {exc}")
             if model_choice == "IndoBERT" and model_source == HF_MODEL_REPO:
                 st.info(
-                    "Pastikan repo Hugging Face berisi file model IndoBERT, seperti config.json, "
-                    "model.safetensors, tokenizer.json, dan tokenizer_config.json."
+                    "Pastikan repo Hugging Face berisi file model IndoBERT di root repo atau subfolder yang dipilih, "
+                    "seperti config.json, model.safetensors, tokenizer.json, dan tokenizer_config.json."
                 )
 
 st.caption("Output model digunakan sebagai indikator probabilistik dan tetap perlu dibaca sesuai konteks penggunaan.")
