@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -8,16 +9,65 @@ import streamlit as st
 
 
 APP_DIR = Path(__file__).resolve().parent
-HF_MODEL_REPO = os.getenv("HF_MODEL_REPO", "Tomath02/proto4")
+PIPELINE_DIR = APP_DIR.parent
+WORKSPACE_DIR = PIPELINE_DIR.parent
+HF_MODEL_REPO = os.getenv("HF_MODEL_REPO", "Tomath02/proto4").strip()
 HF_MODEL_SUBFOLDER = os.getenv("HF_MODEL_SUBFOLDER", "best_model").strip()
 LOCAL_MODEL_DIR = os.getenv("LOCAL_INDOBERT_MODEL_DIR", "").strip()
-SVM_MODEL_PATH = Path(os.getenv("SVM_MODEL_PATH", APP_DIR / "models" / "svm" / "tfidf_svm_pipeline.joblib"))
-INDOBERT_THRESHOLD = float(os.getenv("INDOBERT_THRESHOLD", "0.5"))
-SVM_THRESHOLD = float(os.getenv("SVM_THRESHOLD", "0.0"))
+
+MODEL_CANDIDATES = [
+    Path(LOCAL_MODEL_DIR) if LOCAL_MODEL_DIR else None,
+    PIPELINE_DIR / "artifacts" / "indobert_final_chatgpt55_clean_p1" / "best_model",
+    WORKSPACE_DIR
+    / "tmp"
+    / "drive_pipeline9_latest"
+    / "artifacts"
+    / "indobert_final_chatgpt55_clean_p1"
+    / "best_model",
+]
+
+
+def is_valid_local_model(candidate: Path | None) -> bool:
+    return bool(
+        candidate
+        and (candidate / "config.json").exists()
+        and ((candidate / "model.safetensors").exists() or (candidate / "pytorch_model.bin").exists())
+    )
+
+
+def pick_default_model_source() -> str:
+    for candidate in MODEL_CANDIDATES:
+        if is_valid_local_model(candidate):
+            return str(candidate)
+    return HF_MODEL_REPO
+
+
+DEFAULT_MODEL_SOURCE = pick_default_model_source()
+DEFAULT_SVM_MODEL_PATH = Path(
+    os.getenv("SVM_MODEL_PATH", APP_DIR / "models" / "svm" / "tfidf_svm_pipeline.joblib")
+)
+
+
+def load_threshold(model_dir: Path, default: float = 0.5) -> float:
+    candidates = [
+        model_dir / "threshold.json",
+        model_dir.parent / "threshold.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            return float(json.loads(path.read_text(encoding="utf-8")).get("threshold", default))
+        except Exception:
+            pass
+    return default
+
+
+DEFAULT_THRESHOLD = load_threshold(Path(DEFAULT_MODEL_SOURCE), default=0.5) if Path(DEFAULT_MODEL_SOURCE).exists() else 0.5
 
 
 st.set_page_config(
-    page_title="Deteksi Teks AI Jurnal Indonesia",
+    page_title="Deteksi Teks AI Pipeline9",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -26,13 +76,13 @@ st.markdown(
     """
 <style>
     .block-container {
-        max-width: 1180px;
-        padding-top: 1.25rem;
+        padding-top: 1.4rem;
         padding-bottom: 2rem;
+        max-width: 1180px;
     }
     .stTextArea textarea {
         font-size: 15px;
-        line-height: 1.55;
+        line-height: 1.5;
         border-radius: 6px;
     }
     .stButton > button {
@@ -42,7 +92,7 @@ st.markdown(
         font-weight: 600;
     }
     [data-testid="stMetricValue"] {
-        font-size: 1.5rem;
+        font-size: 1.55rem;
     }
 </style>
 """,
@@ -68,7 +118,27 @@ def strip_reference_section(text: str) -> str:
         flags=re.IGNORECASE,
     )
     match = pattern.search(text or "")
-    return text[: match.start()].strip() if match else text
+    if match:
+        return text[: match.start()].strip()
+    return text
+
+
+def split_by_words(text: str, target_words: int, overlap_words: int, min_words: int) -> list[str]:
+    words = compact_text(text).split()
+    if len(words) <= target_words:
+        return [compact_text(text)] if len(words) >= min_words else []
+
+    chunks: list[str] = []
+    step = max(1, target_words - overlap_words)
+    start = 0
+    while start < len(words):
+        part = words[start : start + target_words]
+        if len(part) >= min_words:
+            chunks.append(" ".join(part))
+        if start + target_words >= len(words):
+            break
+        start += step
+    return chunks
 
 
 def regroup_lines(lines: list[str], target_words: int) -> list[str]:
@@ -89,24 +159,6 @@ def regroup_lines(lines: list[str], target_words: int) -> list[str]:
     if buffer:
         groups.append(" ".join(buffer))
     return groups
-
-
-def split_by_words(text: str, target_words: int, overlap_words: int, min_words: int) -> list[str]:
-    words = compact_text(text).split()
-    if len(words) <= target_words:
-        return [compact_text(text)] if len(words) >= min_words else []
-
-    chunks: list[str] = []
-    step = max(1, target_words - overlap_words)
-    start = 0
-    while start < len(words):
-        part = words[start : start + target_words]
-        if len(part) >= min_words:
-            chunks.append(" ".join(part))
-        if start + target_words >= len(words):
-            break
-        start += step
-    return chunks
 
 
 def split_blocks(text: str, min_words: int) -> list[str]:
@@ -134,7 +186,9 @@ def extract_pdf_text(uploaded_file) -> str:
 
     data = uploaded_file.read()
     doc = fitz.open(stream=data, filetype="pdf")
-    pages = [page.get_text("text") or "" for page in doc]
+    pages = []
+    for page in doc:
+        pages.append(page.get_text("text") or "")
     return "\n\n".join(pages).strip()
 
 
@@ -148,22 +202,32 @@ def extract_txt_text(uploaded_file) -> str:
     return str(raw)
 
 
+def load_config(model_dir: Path) -> dict:
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def infer_ai_label_id(config) -> int:
-    label2id = {str(key).lower(): int(value) for key, value in (getattr(config, "label2id", None) or {}).items()}
+    if not isinstance(config, dict):
+        config = {
+            "label2id": getattr(config, "label2id", None),
+            "id2label": getattr(config, "id2label", None),
+        }
+
+    label2id = {str(k).lower(): int(v) for k, v in (config.get("label2id") or {}).items()}
     if "ai" in label2id:
         return label2id["ai"]
 
-    id2label = {int(key): str(value).lower() for key, value in (getattr(config, "id2label", None) or {}).items()}
+    id2label = {int(k): str(v).lower() for k, v in (config.get("id2label") or {}).items()}
     for idx, label in id2label.items():
         if label == "ai" or "ai" in label:
             return idx
     return 1
-
-
-def resolve_model_source() -> str:
-    if LOCAL_MODEL_DIR and Path(LOCAL_MODEL_DIR).exists():
-        return LOCAL_MODEL_DIR
-    return HF_MODEL_REPO
 
 
 @st.cache_resource(show_spinner="Memuat model IndoBERT...")
@@ -171,26 +235,29 @@ def load_indobert_model(model_source: str, hf_subfolder: str):
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    source_path = Path(model_source)
-    use_local = source_path.exists()
+    path = Path(model_source)
+    use_local = path.exists()
     subfolder = None if use_local or not hf_subfolder.strip() else hf_subfolder.strip()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_source, local_files_only=use_local, subfolder=subfolder)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_source,
-        local_files_only=use_local,
-        subfolder=subfolder,
-    )
-    ai_label_id = infer_ai_label_id(model.config)
+    if use_local:
+        config = load_config(path)
+        tokenizer = AutoTokenizer.from_pretrained(str(path), local_files_only=True)
+        model = AutoModelForSequenceClassification.from_pretrained(str(path), local_files_only=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_source, subfolder=subfolder)
+        model = AutoModelForSequenceClassification.from_pretrained(model_source, subfolder=subfolder)
+        config = model.config
 
+    ai_label_id = infer_ai_label_id(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
-    id2label = {int(key): str(value).lower() for key, value in (model.config.id2label or {}).items()}
+
+    id2label = {int(k): str(v).lower() for k, v in (model.config.id2label or {}).items()}
     return tokenizer, model, device, ai_label_id, id2label
 
 
-@st.cache_resource(show_spinner="Memuat baseline TF-IDF + SVM...")
+@st.cache_resource(show_spinner="Memuat model TF-IDF + SVM...")
 def load_svm_model(model_path: str):
     import joblib
 
@@ -263,20 +330,21 @@ def build_svm_chunks(blocks: list[str]) -> list[dict]:
     rows: list[dict] = []
     for block_index, block in enumerate(blocks, start=1):
         block = compact_text(block)
-        if block:
-            rows.append(
-                {
-                    "block": block_index,
-                    "chunk_index": 1,
-                    "chunk_count": 1,
-                    "word_count": len(block.split()),
-                    "text": block,
-                }
-            )
+        if not block:
+            continue
+        rows.append(
+            {
+                "block": block_index,
+                "chunk_index": 1,
+                "chunk_count": 1,
+                "word_count": len(block.split()),
+                "text": block,
+            }
+        )
     return rows
 
 
-def predict_indobert_batch(chunk_rows: list[dict], tokenizer, model, device, ai_label_id: int, max_length: int) -> list[float]:
+def predict_batch(chunk_rows: list[dict], tokenizer, model, device, ai_label_id: int, max_length: int) -> list[float]:
     import torch
 
     scores: list[float] = []
@@ -301,7 +369,8 @@ def predict_indobert_batch(chunk_rows: list[dict], tokenizer, model, device, ai_
 
 
 def predict_svm_batch(chunk_rows: list[dict], svm_model) -> list[float]:
-    scores = svm_model.decision_function([row["text"] for row in chunk_rows])
+    texts = [row["text"] for row in chunk_rows]
+    scores = svm_model.decision_function(texts)
     return [float(value) for value in scores]
 
 
@@ -310,10 +379,16 @@ def aggregate_score(scores: list[float], mode: str) -> float:
         return 0.0
     if mode == "max":
         return max(scores)
+    if mode == "p90":
+        ordered = sorted(scores)
+        index = int(round((len(ordered) - 1) * 0.90))
+        return ordered[index]
     if mode == "median":
         ordered = sorted(scores)
         mid = len(ordered) // 2
-        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return (ordered[mid - 1] + ordered[mid]) / 2
     return sum(scores) / len(scores)
 
 
@@ -331,30 +406,40 @@ def render_svm_result(score_ai: float, threshold: float) -> None:
     indicator = 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, score_ai - threshold))))
     st.markdown(f"<h1 style='margin-bottom:0;color:{color}'>{label}</h1>", unsafe_allow_html=True)
     st.metric("Skor SVM AI", f"{score_ai:.4f}")
-    st.caption("Skor SVM adalah decision score, bukan probabilitas.")
+    st.caption("Skor >= batas berarti AI. Skor ini bukan probabilitas.")
     st.progress(min(1.0, max(0.0, indicator)))
 
 
 st.title("Deteksi Teks Hasil Generative AI")
-st.caption("Model IndoBERT dan baseline TF-IDF + SVM untuk paper jurnal berbahasa Indonesia.")
+st.caption("Pipeline9 IndoBERT dan baseline TF-IDF + SVM untuk paper jurnal berbahasa Indonesia")
 
 with st.sidebar:
     st.header("Konfigurasi")
     model_choice = st.selectbox("Model", ["IndoBERT", "TF-IDF + SVM"], index=0)
-    min_words = st.slider("Minimal kata per blok", 10, 120, 35, 5)
-    aggregate_mode = st.selectbox("Agregasi skor", ["mean", "median", "max"], index=0)
-
     if model_choice == "IndoBERT":
-        model_source = st.text_input("Model IndoBERT", value=resolve_model_source())
+        model_dir = st.text_input("Path model IndoBERT", value=str(DEFAULT_MODEL_SOURCE))
         hf_subfolder = st.text_input("Subfolder Hugging Face", value=HF_MODEL_SUBFOLDER)
-        threshold = st.slider("Batas keputusan AI", 0.01, 0.99, INDOBERT_THRESHOLD, 0.01)
+        threshold_default = (
+            min(0.99, max(0.01, load_threshold(Path(model_dir), default=DEFAULT_THRESHOLD)))
+            if Path(model_dir).exists()
+            else DEFAULT_THRESHOLD
+        )
+        threshold = st.slider("Threshold AI", 0.01, 0.99, float(threshold_default), 0.01)
         max_length = st.select_slider("Max token length", options=[96, 128, 256, 384, 512], value=256)
         overlap_tokens = st.slider("Token overlap", 0, 96, 32, 8)
-        st.caption("Default deploy memakai Hugging Face repo dan subfolder best_model. Untuk lokal, bisa pakai LOCAL_INDOBERT_MODEL_DIR.")
     else:
-        svm_model_path = st.text_input("Path model SVM", value=str(SVM_MODEL_PATH))
-        svm_threshold = st.slider("Batas skor SVM", -2.0, 2.0, SVM_THRESHOLD, 0.05)
-        st.caption("Batas default 0 berarti skor positif diprediksi AI dan skor negatif diprediksi human.")
+        svm_model_path = st.text_input("Path model SVM", value=str(DEFAULT_SVM_MODEL_PATH))
+        svm_threshold = st.slider("Batas skor SVM", -2.0, 2.0, 0.0, 0.05)
+    min_words = st.slider("Minimal kata per blok", 10, 120, 35, 5)
+    aggregate_mode = st.selectbox("Agregasi dokumen", ["mean", "median", "p90", "max"], index=2)
+    if model_choice == "IndoBERT":
+        st.caption(
+            "Default threshold diambil dari threshold.json model. Untuk dokumen panjang, p90 biasanya lebih stabil daripada full-text truncate."
+        )
+    else:
+        st.caption(
+            "SVM memakai decision score. Batas default 0 berarti skor positif diprediksi AI dan skor negatif diprediksi human."
+        )
 
 left, right = st.columns([1.35, 1], gap="large")
 
@@ -374,7 +459,10 @@ with left:
         if uploaded_file is not None:
             try:
                 suffix = Path(uploaded_file.name).suffix.lower()
-                text = extract_pdf_text(uploaded_file) if suffix == ".pdf" else extract_txt_text(uploaded_file)
+                if suffix == ".pdf":
+                    text = extract_pdf_text(uploaded_file)
+                else:
+                    text = extract_txt_text(uploaded_file)
                 st.caption(f"Teks terambil: {len(text.split())} kata")
             except Exception as exc:
                 st.error(f"Gagal membaca file: {exc}")
@@ -385,6 +473,10 @@ with right:
     st.subheader("Hasil")
     if not analyze:
         st.info("Masukkan teks atau file, lalu jalankan deteksi.")
+    elif model_choice == "IndoBERT" and not model_dir.strip():
+        st.error(f"Model IndoBERT tidak ditemukan: {model_dir}")
+    elif model_choice == "TF-IDF + SVM" and not Path(svm_model_path).exists():
+        st.error(f"Model SVM tidak ditemukan: {svm_model_path}")
     elif len((text or "").split()) < 10:
         st.warning("Input terlalu pendek untuk dianalisis.")
     else:
@@ -394,7 +486,7 @@ with right:
                 blocks = [compact_text(text)]
 
             if model_choice == "IndoBERT":
-                tokenizer, model, device, ai_label_id, id2label = load_indobert_model(model_source, hf_subfolder)
+                tokenizer, model, device, ai_label_id, id2label = load_indobert_model(model_dir, hf_subfolder)
                 chunk_rows = build_token_chunks(
                     blocks,
                     tokenizer,
@@ -404,9 +496,16 @@ with right:
                 if not chunk_rows:
                     raise ValueError("Tidak ada chunk valid setelah preprocessing.")
 
-                scores = predict_indobert_batch(chunk_rows, tokenizer, model, device, ai_label_id, max_length)
-                final_score = aggregate_score(scores, aggregate_mode)
-                render_indobert_result(final_score, threshold)
+                scores = predict_batch(
+                    chunk_rows,
+                    tokenizer,
+                    model,
+                    device,
+                    ai_label_id=ai_label_id,
+                    max_length=max_length,
+                )
+                score_ai = aggregate_score(scores, aggregate_mode)
+                render_indobert_result(score_ai, threshold)
 
                 stat_cols = st.columns(3)
                 stat_cols[0].metric("Blok", len(blocks))
@@ -419,7 +518,7 @@ with right:
                 chunk_df["prediksi"] = ["AI" if score >= threshold else "Human" for score in scores]
                 score_column = "prob_ai"
                 score_label = "Probabilitas AI"
-                download_name = "hasil_deteksi_indobert.csv"
+                download_name = "hasil_deteksi_indobert_pipeline9.csv"
                 display_columns = [
                     "block",
                     "chunk_index",
@@ -429,19 +528,16 @@ with right:
                     "prediksi",
                     "preview",
                 ]
+                caption = "Output IndoBERT berupa probabilitas kelas AI."
             else:
-                svm_path = Path(svm_model_path)
-                if not svm_path.exists():
-                    raise FileNotFoundError(f"Model SVM tidak ditemukan: {svm_path}")
-
-                svm_model = load_svm_model(str(svm_path))
+                svm_model = load_svm_model(svm_model_path)
                 chunk_rows = build_svm_chunks(blocks)
                 if not chunk_rows:
                     raise ValueError("Tidak ada chunk valid setelah preprocessing.")
 
                 scores = predict_svm_batch(chunk_rows, svm_model)
-                final_score = aggregate_score(scores, aggregate_mode)
-                render_svm_result(final_score, svm_threshold)
+                score_ai = aggregate_score(scores, aggregate_mode)
+                render_svm_result(score_ai, svm_threshold)
 
                 stat_cols = st.columns(3)
                 stat_cols[0].metric("Blok", len(blocks))
@@ -454,7 +550,7 @@ with right:
                 chunk_df["prediksi"] = ["AI" if score >= svm_threshold else "Human" for score in scores]
                 score_column = "svm_score_ai"
                 score_label = "Skor SVM AI"
-                download_name = "hasil_deteksi_svm.csv"
+                download_name = "hasil_deteksi_svm_pipeline9.csv"
                 display_columns = [
                     "block",
                     "chunk_index",
@@ -464,21 +560,27 @@ with right:
                     "prediksi",
                     "preview",
                 ]
+                caption = "Output SVM berupa decision score, bukan probabilitas."
 
             chunk_df["preview"] = chunk_df["text"].str.slice(0, 190)
+
             st.dataframe(
                 pd.DataFrame(
                     [
                         {"Agregasi": "mean", score_label: aggregate_score(scores, "mean")},
                         {"Agregasi": "median", score_label: aggregate_score(scores, "median")},
+                        {"Agregasi": "p90", score_label: aggregate_score(scores, "p90")},
                         {"Agregasi": "max", score_label: aggregate_score(scores, "max")},
                     ]
                 ),
                 hide_index=True,
                 width="stretch",
-                column_config={score_label: st.column_config.NumberColumn(score_label, format="%.6f")},
+                column_config={
+                    score_label: st.column_config.NumberColumn(score_label, format="%.6f"),
+                },
             )
 
+            st.caption(caption)
             st.dataframe(
                 chunk_df[display_columns],
                 hide_index=True,
@@ -499,10 +601,5 @@ with right:
             )
         except Exception as exc:
             st.error(f"Gagal menjalankan deteksi: {exc}")
-            if model_choice == "IndoBERT" and model_source == HF_MODEL_REPO:
-                st.info(
-                    "Pastikan repo Hugging Face berisi file model IndoBERT di root repo atau subfolder yang dipilih, "
-                    "seperti config.json, model.safetensors, tokenizer.json, dan tokenizer_config.json."
-                )
 
 st.caption("Output model digunakan sebagai indikator probabilistik dan tetap perlu dibaca sesuai konteks penggunaan.")
