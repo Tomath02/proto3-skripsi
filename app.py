@@ -478,16 +478,6 @@ def render_score_explanation(
     chunk_count: int,
     label: str,
 ) -> None:
-    st.markdown("**Cara hasil diperoleh**")
-    st.markdown(
-        f"""
-1. Teks dinormalisasi dan dipisahkan menjadi blok.
-2. Setiap blok diseleksi memakai aturan preprocessing training, yaitu {TRAINING_MIN_WORDS}-{TRAINING_MAX_WORDS} kata dan bukan bagian referensi, metadata, atau sisa tabel.
-3. Blok yang lolos diproses oleh {model_name}; blok yang tidak lolos hanya ditandai sebagai dilewat.
-4. {score_label} akhir dihitung dari rata-rata skor seluruh chunk/blok yang lolos.
-5. Label akhir ditentukan dengan membandingkan skor akhir terhadap batas keputusan.
-"""
-    )
     st.dataframe(
         pd.DataFrame(
             [
