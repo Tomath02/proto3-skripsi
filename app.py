@@ -48,22 +48,24 @@ DEFAULT_SVM_MODEL_PATH = Path(
 )
 
 
-def load_threshold(model_dir: Path, default: float = 0.5) -> float:
-    candidates = [
-        model_dir / "threshold.json",
-        model_dir.parent / "threshold.json",
-    ]
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            return float(json.loads(path.read_text(encoding="utf-8")).get("threshold", default))
-        except Exception:
-            pass
-    return default
+FIXED_INDOBERT_THRESHOLD = 0.5
+FIXED_SVM_THRESHOLD = 0.0
+FIXED_MAX_LENGTH = 256
+FIXED_TOKEN_OVERLAP = 0
+TRAINING_MIN_WORDS = 45
+TRAINING_MAX_WORDS = 230
+SELECTION_STATUS_PASS = "Lolos"
+SELECTION_STATUS_SKIP = "Dilewat"
 
-
-DEFAULT_THRESHOLD = load_threshold(Path(DEFAULT_MODEL_SOURCE), default=0.5) if Path(DEFAULT_MODEL_SOURCE).exists() else 0.5
+REFERENCE_HEADING_RE = re.compile(
+    r"^\s*(daftar\s+pustaka|referensi|references|bibliography)\s*$",
+    flags=re.IGNORECASE,
+)
+NOISE_BLOCK_RE = re.compile(
+    r"(^\s*\d+\s*$|issn\s*:?\s*\d+|e-issn|p-issn|vol\.?\s*\d+|"
+    r"volume\s+\d+|no\.?\s*\d+|copyright|doi\s*:|email\s*:|e-mail\s*:)",
+    flags=re.IGNORECASE,
+)
 
 
 st.set_page_config(
@@ -104,41 +106,16 @@ def compact_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w-]+\b", text or "", flags=re.UNICODE))
+
+
 def normalize_text(text: str) -> str:
     text = (text or "").replace("\u00a0", " ")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t\f\v]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
-
-
-def strip_reference_section(text: str) -> str:
-    pattern = re.compile(
-        r"\n\s*(daftar\s+pustaka|referensi|references|bibliography)\s*\n",
-        flags=re.IGNORECASE,
-    )
-    match = pattern.search(text or "")
-    if match:
-        return text[: match.start()].strip()
-    return text
-
-
-def split_by_words(text: str, target_words: int, overlap_words: int, min_words: int) -> list[str]:
-    words = compact_text(text).split()
-    if len(words) <= target_words:
-        return [compact_text(text)] if len(words) >= min_words else []
-
-    chunks: list[str] = []
-    step = max(1, target_words - overlap_words)
-    start = 0
-    while start < len(words):
-        part = words[start : start + target_words]
-        if len(part) >= min_words:
-            chunks.append(" ".join(part))
-        if start + target_words >= len(words):
-            break
-        start += step
-    return chunks
 
 
 def regroup_lines(lines: list[str], target_words: int) -> list[str]:
@@ -161,24 +138,115 @@ def regroup_lines(lines: list[str], target_words: int) -> list[str]:
     return groups
 
 
-def split_blocks(text: str, min_words: int) -> list[str]:
-    text = strip_reference_section(normalize_text(text))
-    raw_blocks = [compact_text(part) for part in re.split(r"\n\s*\n+", text) if compact_text(part)]
+def clean_candidate_text(text: str) -> str:
+    text = compact_text(text)
+    text = re.sub(r"^(?:\(?\d+(?:\.\d+)*\)?[.)-]?\s+){1,3}", "", text)
+    text = re.sub(r"^[a-z]\s*[\)\.\-]\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(?:[ivxlcdm]+[.)-]\s+)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(?:gambar|tabel|table|fig(?:ure)?\.?)\s*\d+\s*[:.\-]?\s*", "", text, flags=re.IGNORECASE)
+    return compact_text(text)
+
+
+def looks_english(text: str) -> bool:
+    lowered = f" {(text or '').lower()} "
+    markers = [
+        " the ",
+        " and ",
+        " this ",
+        " that ",
+        " research ",
+        " study ",
+        " result ",
+        " abstract ",
+        " keyword ",
+    ]
+    return sum(1 for marker in markers if marker in lowered) >= 3
+
+
+def high_numeric_ratio(text: str, ratio_limit: float = 0.20) -> bool:
+    tokens = re.findall(r"\b[\w.-]+\b", text or "", flags=re.UNICODE)
+    if not tokens:
+        return True
+    numeric = sum(1 for token in tokens if re.fullmatch(r"\d+(?:[.,]\d+)?", token))
+    return (numeric / max(1, len(tokens))) > ratio_limit
+
+
+def looks_like_list_or_table_residual(text: str) -> bool:
+    clean = compact_text(text)
+    numbered_items = len(re.findall(r"\b\d{1,3}\)", clean))
+    loose_numbered_items = len(re.findall(r"(?:^|\s)\d{1,3}\s+[A-Za-z]", clean))
+    item_codes = len(re.findall(r"\b[A-Z]-\d{2,4}\b", clean))
+    money_like = len(re.findall(r"\bRp\b|\b\d{1,3}(?:\.\d{3})+\b", clean, flags=re.IGNORECASE))
+    brace_rules = len(re.findall(r"[{}|]", clean))
+    return (
+        numbered_items >= 4
+        or loose_numbered_items >= 8
+        or item_codes >= 3
+        or money_like >= 5
+        or brace_rules >= 8
+    )
+
+
+def selection_reason(text: str, is_reference_block: bool, min_words: int, max_words: int) -> str:
+    if is_reference_block:
+        return "Bagian referensi/daftar pustaka tidak digunakan pada training."
+    if not text:
+        return "Teks kosong setelah preprocessing."
+
+    count = word_count(text)
+    reasons: list[str] = []
+    if count < min_words:
+        reasons.append(f"Jumlah kata {count}, kurang dari batas training {min_words}.")
+    if count > max_words:
+        reasons.append(f"Jumlah kata {count}, melebihi batas training {max_words}.")
+    if NOISE_BLOCK_RE.search(text) and count < min_words:
+        reasons.append("Terdeteksi sebagai metadata/header/footer.")
+    if looks_english(text):
+        reasons.append("Terdeteksi dominan bahasa Inggris.")
+    if looks_like_list_or_table_residual(text):
+        reasons.append("Terdeteksi seperti sisa tabel/list.")
+    if high_numeric_ratio(text):
+        reasons.append("Proporsi angka terlalu tinggi.")
+    return " ".join(reasons)
+
+
+def build_block_selection_rows(text: str, min_words: int, max_words: int) -> list[dict]:
+    normalized = normalize_text(text)
+    raw_blocks = [part for part in re.split(r"\n\s*\n+", normalized) if compact_text(part)]
 
     if len(raw_blocks) <= 1 and len(text.split()) > 260:
         lines = [compact_text(line) for line in text.splitlines() if compact_text(line)]
         raw_blocks = regroup_lines(lines, target_words=150)
 
-    blocks: list[str] = []
-    for block in raw_blocks:
-        words = block.split()
-        if len(words) < min_words:
-            continue
-        if len(words) > 230:
-            blocks.extend(split_by_words(block, target_words=150, overlap_words=25, min_words=min_words))
-        else:
-            blocks.append(block)
-    return blocks
+    rows: list[dict] = []
+    in_reference_section = False
+    for block_index, raw_block in enumerate(raw_blocks, start=1):
+        raw_text = compact_text(raw_block)
+        reference_heading = bool(REFERENCE_HEADING_RE.match(raw_text)) or bool(
+            re.match(r"^(daftar\s+pustaka|referensi|references|bibliography)\b", raw_text, flags=re.IGNORECASE)
+        )
+        if reference_heading:
+            in_reference_section = True
+
+        clean_text = clean_candidate_text(raw_text)
+        reason = selection_reason(
+            clean_text,
+            is_reference_block=in_reference_section,
+            min_words=min_words,
+            max_words=max_words,
+        )
+        status = SELECTION_STATUS_SKIP if reason else SELECTION_STATUS_PASS
+        rows.append(
+            {
+                "block": block_index,
+                "status": status,
+                "alasan": reason if reason else "Memenuhi seleksi preprocessing training.",
+                "word_count": word_count(clean_text),
+                "text": clean_text,
+                "preview": clean_text[:190],
+            }
+        )
+    return rows
 
 
 def extract_pdf_text(uploaded_file) -> str:
@@ -265,7 +333,7 @@ def load_svm_model(model_path: str):
 
 
 def build_token_chunks(
-    blocks: list[str],
+    blocks: list[dict],
     tokenizer,
     max_length: int,
     overlap_tokens: int,
@@ -276,8 +344,9 @@ def build_token_chunks(
     step = max(1, chunk_size - overlap)
     rows: list[dict] = []
 
-    for block_index, block in enumerate(blocks, start=1):
-        block = compact_text(block)
+    for block_row in blocks:
+        block_index = int(block_row["block"])
+        block = compact_text(block_row["text"])
         token_ids = tokenizer.encode(block, add_special_tokens=False)
         if not token_ids:
             continue
@@ -326,10 +395,11 @@ def build_token_chunks(
     return rows
 
 
-def build_svm_chunks(blocks: list[str]) -> list[dict]:
+def build_svm_chunks(blocks: list[dict]) -> list[dict]:
     rows: list[dict] = []
-    for block_index, block in enumerate(blocks, start=1):
-        block = compact_text(block)
+    for block_row in blocks:
+        block_index = int(block_row["block"])
+        block = compact_text(block_row["text"])
         if not block:
             continue
         rows.append(
@@ -374,21 +444,9 @@ def predict_svm_batch(chunk_rows: list[dict], svm_model) -> list[float]:
     return [float(value) for value in scores]
 
 
-def aggregate_score(scores: list[float], mode: str) -> float:
+def average_score(scores: list[float]) -> float:
     if not scores:
         return 0.0
-    if mode == "max":
-        return max(scores)
-    if mode == "p90":
-        ordered = sorted(scores)
-        index = int(round((len(ordered) - 1) * 0.90))
-        return ordered[index]
-    if mode == "median":
-        ordered = sorted(scores)
-        mid = len(ordered) // 2
-        if len(ordered) % 2:
-            return ordered[mid]
-        return (ordered[mid - 1] + ordered[mid]) / 2
     return sum(scores) / len(scores)
 
 
@@ -410,6 +468,42 @@ def render_svm_result(score_ai: float, threshold: float) -> None:
     st.progress(min(1.0, max(0.0, indicator)))
 
 
+def render_score_explanation(
+    model_name: str,
+    score_label: str,
+    final_score: float,
+    threshold: float,
+    selected_count: int,
+    skipped_count: int,
+    chunk_count: int,
+    label: str,
+) -> None:
+    st.markdown("**Cara hasil diperoleh**")
+    st.markdown(
+        f"""
+1. Teks dinormalisasi dan dipisahkan menjadi blok.
+2. Setiap blok diseleksi memakai aturan preprocessing training, yaitu {TRAINING_MIN_WORDS}-{TRAINING_MAX_WORDS} kata dan bukan bagian referensi, metadata, atau sisa tabel.
+3. Blok yang lolos diproses oleh {model_name}; blok yang tidak lolos hanya ditandai sebagai dilewat.
+4. {score_label} akhir dihitung dari rata-rata skor seluruh chunk/blok yang lolos.
+5. Label akhir ditentukan dengan membandingkan skor akhir terhadap batas keputusan.
+"""
+    )
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {"Komponen": "Blok lolos seleksi", "Nilai": selected_count},
+                {"Komponen": "Blok dilewat", "Nilai": skipped_count},
+                {"Komponen": "Chunk/blok yang diprediksi", "Nilai": chunk_count},
+                {"Komponen": score_label, "Nilai": f"{final_score:.6f}"},
+                {"Komponen": "Batas keputusan", "Nilai": f"{threshold:.2f}"},
+                {"Komponen": "Hasil akhir", "Nilai": label},
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+
+
 st.title("Deteksi Teks Hasil Generative AI")
 st.caption("Pipeline9 IndoBERT dan baseline TF-IDF + SVM untuk paper jurnal berbahasa Indonesia")
 
@@ -419,26 +513,29 @@ with st.sidebar:
     if model_choice == "IndoBERT":
         model_dir = st.text_input("Path model IndoBERT", value=str(DEFAULT_MODEL_SOURCE))
         hf_subfolder = st.text_input("Subfolder Hugging Face", value=HF_MODEL_SUBFOLDER)
-        threshold_default = (
-            min(0.99, max(0.01, load_threshold(Path(model_dir), default=DEFAULT_THRESHOLD)))
-            if Path(model_dir).exists()
-            else DEFAULT_THRESHOLD
-        )
-        threshold = st.slider("Threshold AI", 0.01, 0.99, float(threshold_default), 0.01)
-        max_length = st.select_slider("Max token length", options=[96, 128, 256, 384, 512], value=256)
-        overlap_tokens = st.slider("Token overlap", 0, 96, 32, 8)
+        threshold = FIXED_INDOBERT_THRESHOLD
+        st.caption(f"Batas keputusan IndoBERT: probabilitas AI >= {threshold:.2f}.")
+        max_length = FIXED_MAX_LENGTH
+        overlap_tokens = FIXED_TOKEN_OVERLAP
+        st.caption(f"Batas masukan IndoBERT: {max_length} token per chunk.")
     else:
         svm_model_path = st.text_input("Path model SVM", value=str(DEFAULT_SVM_MODEL_PATH))
-        svm_threshold = st.slider("Batas skor SVM", -2.0, 2.0, 0.0, 0.05)
-    min_words = st.slider("Minimal kata per blok", 10, 120, 35, 5)
-    aggregate_mode = st.selectbox("Agregasi dokumen", ["mean", "median", "p90", "max"], index=2)
+        svm_threshold = FIXED_SVM_THRESHOLD
+        st.caption(f"Batas keputusan SVM: skor >= {svm_threshold:.2f}.")
+    min_words = TRAINING_MIN_WORDS
+    max_words = TRAINING_MAX_WORDS
+    st.markdown("**Seleksi blok**")
+    st.caption(
+        f"Mengikuti data training: {min_words}-{max_words} kata per blok. "
+        "Blok yang tidak lolos tetap ditampilkan sebagai dilewat."
+    )
     if model_choice == "IndoBERT":
         st.caption(
-            "Default threshold diambil dari threshold.json model. Untuk dokumen panjang, p90 biasanya lebih stabil daripada full-text truncate."
+            "Hasil akhir dihitung dari rata-rata skor blok/chunk yang lolos seleksi."
         )
     else:
         st.caption(
-            "SVM memakai decision score. Batas default 0 berarti skor positif diprediksi AI dan skor negatif diprediksi human."
+            "SVM memakai decision score. Hasil akhir dihitung dari rata-rata skor blok yang lolos seleksi."
         )
 
 left, right = st.columns([1.35, 1], gap="large")
@@ -481,14 +578,37 @@ with right:
         st.warning("Input terlalu pendek untuk dianalisis.")
     else:
         try:
-            blocks = split_blocks(text, min_words=min_words)
-            if not blocks and text.strip():
-                blocks = [compact_text(text)]
+            block_rows = build_block_selection_rows(text, min_words=min_words, max_words=max_words)
+            selected_blocks = [row for row in block_rows if row["status"] == SELECTION_STATUS_PASS]
+            skipped_count = len(block_rows) - len(selected_blocks)
+
+            selection_df = pd.DataFrame(
+                block_rows,
+                columns=["block", "status", "alasan", "word_count", "text", "preview"],
+            )
+            selection_columns = ["block", "status", "word_count", "alasan", "preview"]
+
+            if not selected_blocks:
+                st.warning(
+                    "Tidak ada blok yang lolos seleksi preprocessing training. "
+                    "Blok tetap ditampilkan agar bagian yang dilewat dapat diperiksa."
+                )
+                st.dataframe(
+                    selection_df[selection_columns],
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "preview": st.column_config.TextColumn("preview", width="large"),
+                        "alasan": st.column_config.TextColumn("alasan", width="large"),
+                    },
+                    row_height=86,
+                )
+                st.stop()
 
             if model_choice == "IndoBERT":
                 tokenizer, model, device, ai_label_id, id2label = load_indobert_model(model_dir, hf_subfolder)
                 chunk_rows = build_token_chunks(
-                    blocks,
+                    selected_blocks,
                     tokenizer,
                     max_length=max_length,
                     overlap_tokens=overlap_tokens,
@@ -504,20 +624,23 @@ with right:
                     ai_label_id=ai_label_id,
                     max_length=max_length,
                 )
-                score_ai = aggregate_score(scores, aggregate_mode)
+                score_ai = average_score(scores)
+                final_label = "AI" if score_ai >= threshold else "Human"
                 render_indobert_result(score_ai, threshold)
 
-                stat_cols = st.columns(3)
-                stat_cols[0].metric("Blok", len(blocks))
-                stat_cols[1].metric("Token-chunk", len(chunk_rows))
-                stat_cols[2].metric("Threshold", f"{threshold:.2f}")
-                st.caption(f"Device: {device} | AI label id: {ai_label_id} | id2label: {id2label} | agregasi: {aggregate_mode}")
+                stat_cols = st.columns(4)
+                stat_cols[0].metric("Blok lolos", len(selected_blocks))
+                stat_cols[1].metric("Dilewat", skipped_count)
+                stat_cols[2].metric("Token-chunk", len(chunk_rows))
+                stat_cols[3].metric("Threshold", f"{threshold:.2f}")
+                st.caption(f"Device: {device} | AI label id: {ai_label_id} | id2label: {id2label}")
 
                 chunk_df = pd.DataFrame(chunk_rows)
                 chunk_df["prob_ai"] = scores
                 chunk_df["prediksi"] = ["AI" if score >= threshold else "Human" for score in scores]
                 score_column = "prob_ai"
                 score_label = "Probabilitas AI"
+                explanation_model_name = "IndoBERT"
                 download_name = "hasil_deteksi_indobert_pipeline9.csv"
                 display_columns = [
                     "block",
@@ -531,25 +654,28 @@ with right:
                 caption = "Output IndoBERT berupa probabilitas kelas AI."
             else:
                 svm_model = load_svm_model(svm_model_path)
-                chunk_rows = build_svm_chunks(blocks)
+                chunk_rows = build_svm_chunks(selected_blocks)
                 if not chunk_rows:
                     raise ValueError("Tidak ada chunk valid setelah preprocessing.")
 
                 scores = predict_svm_batch(chunk_rows, svm_model)
-                score_ai = aggregate_score(scores, aggregate_mode)
+                score_ai = average_score(scores)
+                final_label = "AI" if score_ai >= svm_threshold else "Human"
                 render_svm_result(score_ai, svm_threshold)
 
-                stat_cols = st.columns(3)
-                stat_cols[0].metric("Blok", len(blocks))
-                stat_cols[1].metric("Chunk teks", len(chunk_rows))
-                stat_cols[2].metric("Batas SVM", f"{svm_threshold:.2f}")
-                st.caption(f"Model: TF-IDF + LinearSVC | agregasi: {aggregate_mode}")
+                stat_cols = st.columns(4)
+                stat_cols[0].metric("Blok lolos", len(selected_blocks))
+                stat_cols[1].metric("Dilewat", skipped_count)
+                stat_cols[2].metric("Chunk teks", len(chunk_rows))
+                stat_cols[3].metric("Batas SVM", f"{svm_threshold:.2f}")
+                st.caption("Model: TF-IDF + LinearSVC")
 
                 chunk_df = pd.DataFrame(chunk_rows)
                 chunk_df["svm_score_ai"] = scores
                 chunk_df["prediksi"] = ["AI" if score >= svm_threshold else "Human" for score in scores]
                 score_column = "svm_score_ai"
                 score_label = "Skor SVM AI"
+                explanation_model_name = "TF-IDF + SVM"
                 download_name = "hasil_deteksi_svm_pipeline9.csv"
                 display_columns = [
                     "block",
@@ -564,20 +690,30 @@ with right:
 
             chunk_df["preview"] = chunk_df["text"].str.slice(0, 190)
 
+            render_score_explanation(
+                model_name=explanation_model_name,
+                score_label=score_label,
+                final_score=score_ai,
+                threshold=threshold if model_choice == "IndoBERT" else svm_threshold,
+                selected_count=len(selected_blocks),
+                skipped_count=skipped_count,
+                chunk_count=len(chunk_rows),
+                label=final_label,
+            )
+
+            st.caption(
+                "Seleksi blok mengikuti preprocessing training. "
+                "Blok berstatus dilewat tidak masuk proses prediksi, tetapi tetap ditampilkan."
+            )
             st.dataframe(
-                pd.DataFrame(
-                    [
-                        {"Agregasi": "mean", score_label: aggregate_score(scores, "mean")},
-                        {"Agregasi": "median", score_label: aggregate_score(scores, "median")},
-                        {"Agregasi": "p90", score_label: aggregate_score(scores, "p90")},
-                        {"Agregasi": "max", score_label: aggregate_score(scores, "max")},
-                    ]
-                ),
+                selection_df[selection_columns],
                 hide_index=True,
                 width="stretch",
                 column_config={
-                    score_label: st.column_config.NumberColumn(score_label, format="%.6f"),
+                    "preview": st.column_config.TextColumn("preview", width="large"),
+                    "alasan": st.column_config.TextColumn("alasan", width="large"),
                 },
+                row_height=86,
             )
 
             st.caption(caption)
@@ -597,6 +733,14 @@ with right:
                 "Download hasil chunk",
                 data=csv_bytes,
                 file_name=download_name,
+                mime="text/csv",
+            )
+
+            selection_csv_bytes = selection_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "Download seleksi blok",
+                data=selection_csv_bytes,
+                file_name="hasil_seleksi_blok_pipeline9.csv",
                 mime="text/csv",
             )
         except Exception as exc:
